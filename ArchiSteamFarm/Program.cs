@@ -1,10 +1,12 @@
+// ----------------------------------------------------------------------------------------------
 //     _                _      _  ____   _                           _____
 //    / \    _ __  ___ | |__  (_)/ ___| | |_  ___   __ _  _ __ ___  |  ___|__ _  _ __  _ __ ___
 //   / _ \  | '__|/ __|| '_ \ | |\___ \ | __|/ _ \ / _` || '_ ` _ \ | |_  / _` || '__|| '_ ` _ \
 //  / ___ \ | |  | (__ | | | || | ___) || |_|  __/| (_| || | | | | ||  _|| (_| || |   | | | | | |
 // /_/   \_\|_|   \___||_| |_||_||____/  \__|\___| \__,_||_| |_| |_||_|   \__,_||_|   |_| |_| |_|
+// ----------------------------------------------------------------------------------------------
 // |
-// Copyright 2015-2023 Łukasz "JustArchi" Domeradzki
+// Copyright 2015-2025 Łukasz "JustArchi" Domeradzki
 // Contact: JustArchi@JustArchi.net
 // |
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,8 +22,8 @@
 // limitations under the License.
 
 using System;
+using System.Collections.Frozen;
 using System.Collections.Generic;
-using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
@@ -32,6 +34,7 @@ using System.Text;
 using System.Threading.Tasks;
 using ArchiSteamFarm.Core;
 using ArchiSteamFarm.Helpers;
+using ArchiSteamFarm.Helpers.Json;
 using ArchiSteamFarm.IPC;
 using ArchiSteamFarm.Localization;
 using ArchiSteamFarm.NLog;
@@ -39,43 +42,33 @@ using ArchiSteamFarm.NLog.Targets;
 using ArchiSteamFarm.Steam;
 using ArchiSteamFarm.Storage;
 using ArchiSteamFarm.Web;
-using Newtonsoft.Json;
 using NLog;
 using SteamKit2;
-#if !NETFRAMEWORK && !NETSTANDARD
-using System.Net.Quic;
-#endif
 
 namespace ArchiSteamFarm;
 
 internal static class Program {
+	internal static bool AllowCrashFileRemoval { get; set; }
 	internal static bool ConfigMigrate { get; private set; } = true;
 	internal static bool ConfigWatch { get; private set; } = true;
+	internal static bool IgnoreUnsupportedEnvironment { get; private set; }
 	internal static string? NetworkGroup { get; private set; }
-	internal static bool ProcessRequired { get; private set; }
 	internal static bool RestartAllowed { get; private set; } = true;
 	internal static bool Service { get; private set; }
 	internal static bool ShutdownSequenceInitialized { get; private set; }
 	internal static bool SteamParentalGeneration { get; private set; } = true;
 
-#if !NETFRAMEWORK && !NETSTANDARD
 	private static readonly Dictionary<PosixSignal, PosixSignalRegistration> RegisteredPosixSignals = new();
-#endif
-
 	private static readonly TaskCompletionSource<byte> ShutdownResetEvent = new();
+	private static readonly FrozenSet<PosixSignal> SupportedPosixSignals = new HashSet<PosixSignal>(2) { PosixSignal.SIGINT, PosixSignal.SIGTERM }.ToFrozenSet();
 
-#if !NETFRAMEWORK && !NETSTANDARD
-	private static readonly ImmutableHashSet<PosixSignal> SupportedPosixSignals = ImmutableHashSet.Create(PosixSignal.SIGINT, PosixSignal.SIGTERM);
-#endif
-
-	private static bool IgnoreUnsupportedEnvironment;
 	private static bool InputCryptkeyManually;
 	private static bool Minimized;
 	private static bool SystemRequired;
 
 	internal static async Task Exit(byte exitCode = 0) {
 		if (exitCode != 0) {
-			ASF.ArchiLogger.LogGenericError(Strings.ErrorExitingWithNonZeroErrorCode);
+			ASF.ArchiLogger.LogGenericError(Strings.FormatErrorExitingWithNonZeroErrorCode(exitCode));
 		}
 
 		await Shutdown(exitCode).ConfigureAwait(false);
@@ -89,14 +82,12 @@ internal static class Program {
 
 		string executableName = Path.GetFileNameWithoutExtension(OS.ProcessFileName);
 
-		if (string.IsNullOrEmpty(executableName)) {
-			throw new ArgumentNullException(nameof(executableName));
-		}
+		ArgumentException.ThrowIfNullOrEmpty(executableName);
 
 		IEnumerable<string> arguments = Environment.GetCommandLineArgs().Skip(executableName.Equals(SharedInfo.AssemblyName, StringComparison.Ordinal) ? 1 : 0);
 
 		try {
-			Process.Start(OS.ProcessFileName, string.Join(" ", arguments));
+			Process.Start(OS.ProcessFileName, string.Join(' ', arguments));
 		} catch (Exception e) {
 			ASF.ArchiLogger.LogGenericException(e);
 		}
@@ -109,20 +100,16 @@ internal static class Program {
 	}
 
 	private static void HandleCryptKeyArgument(string cryptKey) {
-		if (string.IsNullOrEmpty(cryptKey)) {
-			throw new ArgumentNullException(nameof(cryptKey));
-		}
+		ArgumentException.ThrowIfNullOrEmpty(cryptKey);
 
 		ArchiCryptoHelper.SetEncryptionKey(cryptKey);
 	}
 
 	private static async Task<bool> HandleCryptKeyFileArgument(string cryptKeyFile) {
-		if (string.IsNullOrEmpty(cryptKeyFile)) {
-			throw new ArgumentNullException(nameof(cryptKeyFile));
-		}
+		ArgumentException.ThrowIfNullOrEmpty(cryptKeyFile);
 
 		if (!File.Exists(cryptKeyFile)) {
-			ASF.ArchiLogger.LogGenericError(string.Format(CultureInfo.CurrentCulture, Strings.ErrorIsInvalid, nameof(cryptKeyFile)));
+			ASF.ArchiLogger.LogGenericError(Strings.FormatErrorIsInvalid(nameof(cryptKeyFile)));
 
 			return false;
 		}
@@ -138,7 +125,7 @@ internal static class Program {
 		}
 
 		if (string.IsNullOrEmpty(cryptKey)) {
-			ASF.ArchiLogger.LogGenericError(string.Format(CultureInfo.CurrentCulture, Strings.ErrorIsEmpty, nameof(cryptKeyFile)));
+			ASF.ArchiLogger.LogGenericError(Strings.FormatErrorIsEmpty(nameof(cryptKeyFile)));
 
 			return false;
 		}
@@ -149,17 +136,13 @@ internal static class Program {
 	}
 
 	private static void HandleNetworkGroupArgument(string networkGroup) {
-		if (string.IsNullOrEmpty(networkGroup)) {
-			throw new ArgumentNullException(nameof(networkGroup));
-		}
+		ArgumentException.ThrowIfNullOrEmpty(networkGroup);
 
 		NetworkGroup = networkGroup;
 	}
 
 	private static bool HandlePathArgument(string path) {
-		if (string.IsNullOrEmpty(path)) {
-			throw new ArgumentNullException(nameof(path));
-		}
+		ArgumentException.ThrowIfNullOrEmpty(path);
 
 		// Aid userspace and replace ~ with user's home directory if possible
 		if (path.Contains('~', StringComparison.Ordinal)) {
@@ -192,15 +175,11 @@ internal static class Program {
 		AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
 		TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
 
-#if NETFRAMEWORK || NETSTANDARD
-		RuntimeMadness.Initialize();
-#else
 		if (OperatingSystem.IsFreeBSD() || OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()) {
 			foreach (PosixSignal signal in SupportedPosixSignals) {
 				RegisteredPosixSignals[signal] = PosixSignalRegistration.Create(signal, OnPosixSignal);
 			}
 		}
-#endif
 
 		Console.CancelKeyPress += OnCancelKeyPress;
 
@@ -227,13 +206,7 @@ internal static class Program {
 
 		OS.Init(ASF.GlobalConfig?.OptimizationMode ?? GlobalConfig.DefaultOptimizationMode);
 
-		if (!await InitGlobalDatabaseAndServices().ConfigureAwait(false)) {
-			return false;
-		}
-
-		await ASF.Init().ConfigureAwait(false);
-
-		return true;
+		return await InitGlobalDatabaseAndServices().ConfigureAwait(false) && await ASF.Init().ConfigureAwait(false);
 	}
 
 	private static async Task<bool> InitCore(IReadOnlyCollection<string>? args) {
@@ -314,15 +287,14 @@ internal static class Program {
 		string? copyright = Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyCopyrightAttribute>()?.Copyright;
 
 		if (!string.IsNullOrEmpty(copyright)) {
-			// ReSharper disable once RedundantSuppressNullableWarningExpression - required for .NET Framework
-			ASF.ArchiLogger.LogGenericInfo(copyright!);
+			ASF.ArchiLogger.LogGenericInfo(copyright);
 		}
 
 		if (IgnoreUnsupportedEnvironment) {
 			ASF.ArchiLogger.LogGenericWarning(Strings.WarningRunningInUnsupportedEnvironment);
 		} else {
 			if (!OS.VerifyEnvironment()) {
-				ASF.ArchiLogger.LogGenericError(string.Format(CultureInfo.CurrentCulture, Strings.WarningUnsupportedEnvironment, SharedInfo.BuildInfo.Variant, OS.Version));
+				ASF.ArchiLogger.LogGenericError(Strings.FormatWarningUnsupportedEnvironment(BuildInfo.Variant, OS.Version));
 				await Task.Delay(SharedInfo.InformationDelay).ConfigureAwait(false);
 
 				return false;
@@ -338,13 +310,12 @@ internal static class Program {
 			string? cryptkey = await Logging.GetUserInput(ASF.EUserInputType.Cryptkey).ConfigureAwait(false);
 
 			if (string.IsNullOrEmpty(cryptkey)) {
-				ASF.ArchiLogger.LogGenericError(string.Format(CultureInfo.CurrentCulture, Strings.ErrorIsInvalid, nameof(cryptkey)));
+				ASF.ArchiLogger.LogGenericError(Strings.FormatErrorIsInvalid(nameof(cryptkey)));
 
 				return false;
 			}
 
-			// ReSharper disable once RedundantSuppressNullableWarningExpression - required for .NET Framework
-			ArchiCryptoHelper.SetEncryptionKey(cryptkey!);
+			ArchiCryptoHelper.SetEncryptionKey(cryptkey);
 		}
 
 		if (!Directory.Exists(SharedInfo.ConfigDirectory)) {
@@ -361,7 +332,7 @@ internal static class Program {
 		string globalConfigFile = ASF.GetFilePath(ASF.EFileType.Config);
 
 		if (string.IsNullOrEmpty(globalConfigFile)) {
-			throw new ArgumentNullException(nameof(globalConfigFile));
+			throw new InvalidOperationException(nameof(globalConfigFile));
 		}
 
 		string? latestJson = null;
@@ -372,7 +343,7 @@ internal static class Program {
 			(globalConfig, latestJson) = await GlobalConfig.Load(globalConfigFile).ConfigureAwait(false);
 
 			if (globalConfig == null) {
-				ASF.ArchiLogger.LogGenericError(string.Format(CultureInfo.CurrentCulture, Strings.ErrorGlobalConfigNotLoaded, globalConfigFile));
+				ASF.ArchiLogger.LogGenericError(Strings.FormatErrorGlobalConfigNotLoaded(globalConfigFile));
 				await Task.Delay(SharedInfo.ShortInformationDelay).ConfigureAwait(false);
 
 				return false;
@@ -382,13 +353,13 @@ internal static class Program {
 		}
 
 		if (globalConfig.Debug) {
-			ASF.ArchiLogger.LogGenericDebug($"{globalConfigFile}: {JsonConvert.SerializeObject(globalConfig, Formatting.Indented)}");
+			ASF.ArchiLogger.LogGenericDebug($"{globalConfigFile}: {globalConfig.ToJsonText(true)}");
 		}
 
 		if (!string.IsNullOrEmpty(globalConfig.CurrentCulture)) {
 			try {
 				// GetCultureInfo() would be better but we can't use it for specifying neutral cultures such as "en"
-				CultureInfo culture = CultureInfo.CreateSpecificCulture(globalConfig.CurrentCulture!);
+				CultureInfo culture = CultureInfo.CreateSpecificCulture(globalConfig.CurrentCulture);
 				CultureInfo.DefaultThreadCurrentCulture = CultureInfo.DefaultThreadCurrentUICulture = culture;
 			} catch (Exception e) {
 				ASF.ArchiLogger.LogGenericWarningException(e);
@@ -401,10 +372,9 @@ internal static class Program {
 		}
 
 		if (!string.IsNullOrEmpty(latestJson)) {
-			ASF.ArchiLogger.LogGenericWarning(string.Format(CultureInfo.CurrentCulture, Strings.AutomaticFileMigration, globalConfigFile));
+			ASF.ArchiLogger.LogGenericWarning(Strings.FormatAutomaticFileMigration(globalConfigFile));
 
-			// ReSharper disable once RedundantSuppressNullableWarningExpression - required for .NET Framework
-			await SerializableFile.Write(globalConfigFile, latestJson!).ConfigureAwait(false);
+			await SerializableFile.Write(globalConfigFile, latestJson).ConfigureAwait(false);
 
 			ASF.ArchiLogger.LogGenericInfo(Strings.Done);
 		}
@@ -420,7 +390,7 @@ internal static class Program {
 		string globalDatabaseFile = ASF.GetFilePath(ASF.EFileType.Database);
 
 		if (string.IsNullOrEmpty(globalDatabaseFile)) {
-			throw new ArgumentNullException(nameof(globalDatabaseFile));
+			throw new InvalidOperationException(nameof(globalDatabaseFile));
 		}
 
 		if (!File.Exists(globalDatabaseFile)) {
@@ -433,7 +403,7 @@ internal static class Program {
 		GlobalDatabase? globalDatabase = await GlobalDatabase.CreateOrLoad(globalDatabaseFile).ConfigureAwait(false);
 
 		if (globalDatabase == null) {
-			ASF.ArchiLogger.LogGenericError(string.Format(CultureInfo.CurrentCulture, Strings.ErrorDatabaseInvalid, globalDatabaseFile));
+			ASF.ArchiLogger.LogGenericError(Strings.FormatErrorDatabaseInvalid(globalDatabaseFile));
 			await Task.Delay(SharedInfo.ShortInformationDelay).ConfigureAwait(false);
 
 			return false;
@@ -443,39 +413,27 @@ internal static class Program {
 
 		// If debugging is on, we prepare debug directory prior to running
 		if (Debugging.IsUserDebugging) {
-			if (Debugging.IsDebugConfigured) {
-				ASF.ArchiLogger.LogGenericDebug($"{globalDatabaseFile}: {JsonConvert.SerializeObject(ASF.GlobalDatabase, Formatting.Indented)}");
-			}
-
 			Logging.EnableTraceLogging();
 
 			if (Debugging.IsDebugConfigured) {
+				ASF.ArchiLogger.LogGenericDebug($"{globalDatabaseFile}: {globalDatabase.ToJsonText(true)}");
+
 				DebugLog.AddListener(new Debugging.DebugListener());
+
 				DebugLog.Enabled = true;
 
-				if (Directory.Exists(SharedInfo.DebugDirectory)) {
-					try {
-						Directory.Delete(SharedInfo.DebugDirectory, true);
-						await Task.Delay(1000).ConfigureAwait(false); // Dirty workaround giving Windows some time to sync
-					} catch (Exception e) {
-						ASF.ArchiLogger.LogGenericException(e);
-					}
+				try {
+					Directory.CreateDirectory(ASF.DebugDirectory);
+				} catch (Exception e) {
+					ASF.ArchiLogger.LogGenericException(e);
 				}
 			}
-
-			try {
-				Directory.CreateDirectory(SharedInfo.DebugDirectory);
-			} catch (Exception e) {
-				ASF.ArchiLogger.LogGenericException(e);
-			}
 		}
-
-		WebBrowser.Init();
 
 		return true;
 	}
 
-	private static async Task<bool> InitShutdownSequence() {
+	private static async Task<bool> InitShutdownSequence(byte exitCode = 0) {
 		if (ShutdownSequenceInitialized) {
 			// We've already initialized shutdown sequence before, we won't allow the caller to init shutdown sequence again
 			// While normally this will be respected, caller might not have any say in this for example because it's the runtime terminating ASF due to fatal exception
@@ -487,16 +445,27 @@ internal static class Program {
 
 		ShutdownSequenceInitialized = true;
 
-#if !NETFRAMEWORK && !NETSTANDARD
+		// Unregister from registered signals
 		if (OperatingSystem.IsFreeBSD() || OperatingSystem.IsLinux() || OperatingSystem.IsMacOS()) {
-			// Unregister from registered signals
 			foreach (PosixSignalRegistration registration in RegisteredPosixSignals.Values) {
 				registration.Dispose();
 			}
 
 			RegisteredPosixSignals.Clear();
 		}
-#endif
+
+		// Remove crash file if allowed
+		if ((exitCode == 0) && AllowCrashFileRemoval) {
+			string crashFile = ASF.GetFilePath(ASF.EFileType.Crash);
+
+			if (File.Exists(crashFile)) {
+				try {
+					File.Delete(crashFile);
+				} catch (Exception e) {
+					ASF.ArchiLogger.LogGenericException(e);
+				}
+			}
+		}
 
 		// Sockets created by IPC might still be running for a short while after complete app shutdown
 		// Ensure that IPC is stopped before we finalize shutdown sequence
@@ -505,7 +474,7 @@ internal static class Program {
 		// Stop all the active bots so they can disconnect cleanly
 		if (Bot.Bots?.Count > 0) {
 			// Stop() function can block due to SK2 sockets, don't forget a maximum delay
-			await Task.WhenAny(Utilities.InParallel(Bot.Bots.Values.Select(static bot => Task.Run(() => bot.Stop(true)))), Task.Delay(Bot.Bots.Count * WebBrowser.MaxTries * 1000)).ConfigureAwait(false);
+			await Task.WhenAny(Utilities.InParallel(Bot.Bots.Values.Select(static bot => Task.Run(() => bot.Stop(true)))), Task.Delay((Bot.Bots.Count + WebBrowser.MaxTries) * 1000)).ConfigureAwait(false);
 
 			// Extra second for Steam requests to go through
 			await Task.Delay(1000).ConfigureAwait(false);
@@ -530,17 +499,13 @@ internal static class Program {
 		return await ShutdownResetEvent.Task.ConfigureAwait(false);
 	}
 
-	private static async void OnCancelKeyPress(object? sender, ConsoleCancelEventArgs e) => await Exit(130).ConfigureAwait(false);
+	private static async void OnCancelKeyPress(object? sender, ConsoleCancelEventArgs e) => await Exit().ConfigureAwait(false);
 
-#if !NETFRAMEWORK && !NETSTANDARD
 	private static async void OnPosixSignal(PosixSignalContext signal) {
 		ArgumentNullException.ThrowIfNull(signal);
 
 		switch (signal.Signal) {
 			case PosixSignal.SIGINT:
-				await Exit(130).ConfigureAwait(false);
-
-				break;
 			case PosixSignal.SIGTERM:
 				await Exit().ConfigureAwait(false);
 
@@ -549,7 +514,6 @@ internal static class Program {
 				throw new InvalidOperationException(nameof(signal.Signal));
 		}
 	}
-#endif
 
 	private static async void OnProcessExit(object? sender, EventArgs e) => await Shutdown().ConfigureAwait(false);
 
@@ -558,17 +522,17 @@ internal static class Program {
 		ArgumentNullException.ThrowIfNull(e.ExceptionObject);
 
 		await ASF.ArchiLogger.LogFatalException((Exception) e.ExceptionObject).ConfigureAwait(false);
-		await Exit(1).ConfigureAwait(false);
+
+		if (e.IsTerminating) {
+			await Exit(1).ConfigureAwait(false);
+		}
 	}
 
 	private static async void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e) {
 		ArgumentNullException.ThrowIfNull(e);
 		ArgumentNullException.ThrowIfNull(e.Exception);
 
-		// TODO: Remove conditionally ignoring QuicException once https://github.com/dotnet/runtime/issues/80111 is resolved
-		if ((e.Exception.InnerExceptions.Count == 0) || e.Exception.InnerExceptions.All(static exception => exception is not QuicException)) {
-			await ASF.ArchiLogger.LogFatalException(e.Exception).ConfigureAwait(false);
-		}
+		await ASF.ArchiLogger.LogFatalException(e.Exception).ConfigureAwait(false);
 
 		// Normally we should abort the application, but due to the fact that unobserved exceptions do not have to do that, it's a better idea to log it and try to continue
 		e.SetObserved();
@@ -626,10 +590,6 @@ internal static class Program {
 					SteamParentalGeneration = false;
 
 					break;
-				case "--PROCESS-REQUIRED" when noArgumentValueNext():
-					ProcessRequired = true;
-
-					break;
 				case "--PATH" when noArgumentValueNext():
 					pathNext = true;
 
@@ -684,7 +644,7 @@ internal static class Program {
 
 								break;
 							default:
-								ASF.ArchiLogger.LogGenericWarning(string.Format(CultureInfo.CurrentCulture, Strings.WarningUnknownCommandLineArgument, arg));
+								ASF.ArchiLogger.LogGenericWarning(Strings.FormatWarningUnknownCommandLineArgument(arg));
 
 								break;
 						}
@@ -702,18 +662,24 @@ internal static class Program {
 	private static async Task<bool> ParseEnvironmentVariables() {
 		// We're using a single try-catch block here, as a failure for getting one variable will result in the same failure for all other ones
 		try {
+			string? envPath = Environment.GetEnvironmentVariable(SharedInfo.EnvironmentVariablePath);
+
+			if (!string.IsNullOrEmpty(envPath)) {
+				if (!HandlePathArgument(envPath)) {
+					return false;
+				}
+			}
+
 			string? envCryptKey = Environment.GetEnvironmentVariable(SharedInfo.EnvironmentVariableCryptKey);
 
 			if (!string.IsNullOrEmpty(envCryptKey)) {
-				// ReSharper disable once RedundantSuppressNullableWarningExpression - required for .NET Framework
-				HandleCryptKeyArgument(envCryptKey!);
+				HandleCryptKeyArgument(envCryptKey);
 			}
 
 			string? envCryptKeyFile = Environment.GetEnvironmentVariable(SharedInfo.EnvironmentVariableCryptKeyFile);
 
 			if (!string.IsNullOrEmpty(envCryptKeyFile)) {
-				// ReSharper disable once RedundantSuppressNullableWarningExpression - required for .NET Framework
-				if (!await HandleCryptKeyFileArgument(envCryptKeyFile!).ConfigureAwait(false)) {
+				if (!await HandleCryptKeyFileArgument(envCryptKeyFile).ConfigureAwait(false)) {
 					return false;
 				}
 			}
@@ -721,17 +687,7 @@ internal static class Program {
 			string? envNetworkGroup = Environment.GetEnvironmentVariable(SharedInfo.EnvironmentVariableNetworkGroup);
 
 			if (!string.IsNullOrEmpty(envNetworkGroup)) {
-				// ReSharper disable once RedundantSuppressNullableWarningExpression - required for .NET Framework
-				HandleNetworkGroupArgument(envNetworkGroup!);
-			}
-
-			string? envPath = Environment.GetEnvironmentVariable(SharedInfo.EnvironmentVariablePath);
-
-			if (!string.IsNullOrEmpty(envPath)) {
-				// ReSharper disable once RedundantSuppressNullableWarningExpression - required for .NET Framework
-				if (!HandlePathArgument(envPath!)) {
-					return false;
-				}
+				HandleNetworkGroupArgument(envNetworkGroup);
 			}
 		} catch (Exception e) {
 			ASF.ArchiLogger.LogGenericException(e);
@@ -743,7 +699,7 @@ internal static class Program {
 	}
 
 	private static async Task Shutdown(byte exitCode = 0) {
-		if (!await InitShutdownSequence().ConfigureAwait(false)) {
+		if (!await InitShutdownSequence(exitCode).ConfigureAwait(false)) {
 			return;
 		}
 

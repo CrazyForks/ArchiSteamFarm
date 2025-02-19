@@ -1,10 +1,12 @@
+// ----------------------------------------------------------------------------------------------
 //     _                _      _  ____   _                           _____
 //    / \    _ __  ___ | |__  (_)/ ___| | |_  ___   __ _  _ __ ___  |  ___|__ _  _ __  _ __ ___
 //   / _ \  | '__|/ __|| '_ \ | |\___ \ | __|/ _ \ / _` || '_ ` _ \ | |_  / _` || '__|| '_ ` _ \
 //  / ___ \ | |  | (__ | | | || | ___) || |_|  __/| (_| || | | | | ||  _|| (_| || |   | | | | | |
 // /_/   \_\|_|   \___||_| |_||_||____/  \__|\___| \__,_||_| |_| |_||_|   \__,_||_|   |_| |_| |_|
+// ----------------------------------------------------------------------------------------------
 // |
-// Copyright 2015-2023 Łukasz "JustArchi" Domeradzki
+// Copyright 2015-2025 Łukasz "JustArchi" Domeradzki
 // Contact: JustArchi@JustArchi.net
 // |
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,13 +22,14 @@
 // limitations under the License.
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics.CodeAnalysis;
-using System.Globalization;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using ArchiSteamFarm.Core;
@@ -34,7 +37,6 @@ using ArchiSteamFarm.Helpers;
 using ArchiSteamFarm.Localization;
 using ArchiSteamFarm.Steam.Data;
 using ArchiSteamFarm.Storage;
-using Newtonsoft.Json;
 
 namespace ArchiSteamFarm.Steam.Security;
 
@@ -42,7 +44,8 @@ namespace ArchiSteamFarm.Steam.Security;
 public sealed class MobileAuthenticator : IDisposable {
 	internal const byte BackupCodeDigits = 7;
 	internal const byte CodeDigits = 5;
-	internal const byte CodeInterval = 30;
+
+	private const byte CodeInterval = 30;
 
 	// For how many minutes we can assume that SteamTimeDifference is correct
 	private const byte SteamTimeTTL = 15;
@@ -56,13 +59,17 @@ public sealed class MobileAuthenticator : IDisposable {
 
 	private readonly ArchiCacheable<string> CachedDeviceID;
 
-	[JsonProperty("identity_secret", Required = Required.Always)]
-	private readonly string IdentitySecret = "";
-
-	[JsonProperty("shared_secret", Required = Required.Always)]
-	private readonly string SharedSecret = "";
-
 	private Bot? Bot;
+
+	[JsonInclude]
+	[JsonPropertyName("identity_secret")]
+	[JsonRequired]
+	private string IdentitySecret { get; init; } = "";
+
+	[JsonInclude]
+	[JsonPropertyName("shared_secret")]
+	[JsonRequired]
+	private string SharedSecret { get; init; } = "";
 
 	[JsonConstructor]
 	private MobileAuthenticator() => CachedDeviceID = new ArchiCacheable<string>(ResolveDeviceID);
@@ -84,9 +91,7 @@ public sealed class MobileAuthenticator : IDisposable {
 	}
 
 	internal string? GenerateTokenForTime(ulong time) {
-		if (time == 0) {
-			throw new ArgumentOutOfRangeException(nameof(time));
-		}
+		ArgumentOutOfRangeException.ThrowIfZero(time);
 
 		if (Bot == null) {
 			throw new InvalidOperationException(nameof(Bot));
@@ -102,7 +107,7 @@ public sealed class MobileAuthenticator : IDisposable {
 			sharedSecret = Convert.FromBase64String(SharedSecret);
 		} catch (FormatException e) {
 			Bot.ArchiLogger.LogGenericException(e);
-			Bot.ArchiLogger.LogGenericError(string.Format(CultureInfo.CurrentCulture, Strings.ErrorIsInvalid, nameof(SharedSecret)));
+			Bot.ArchiLogger.LogGenericError(Strings.FormatErrorIsInvalid(nameof(SharedSecret)));
 
 			return null;
 		}
@@ -120,20 +125,31 @@ public sealed class MobileAuthenticator : IDisposable {
 		// The last 4 bits of the mac say where the code starts
 		int start = hash[^1] & 0x0f;
 
+		uint fullCode;
+
 		// Extract those 4 bytes
-		byte[] bytes = new byte[4];
+		byte[] bytes = ArrayPool<byte>.Shared.Rent(4);
 
-		Array.Copy(hash, start, bytes, 0, 4);
+		try {
+			Array.Copy(hash, start, bytes, 0, 4);
 
-		if (BitConverter.IsLittleEndian) {
-			Array.Reverse(bytes);
+			Span<byte> span;
+
+			if (BitConverter.IsLittleEndian) {
+				Array.Reverse(bytes);
+
+				span = bytes.AsSpan()[^4..];
+			} else {
+				span = bytes.AsSpan()[..4];
+			}
+
+			// Build the alphanumeric code
+			fullCode = BitConverter.ToUInt32(span) & 0x7fffffff;
+		} finally {
+			ArrayPool<byte>.Shared.Return(bytes);
 		}
 
-		// Build the alphanumeric code
-		uint fullCode = BitConverter.ToUInt32(bytes, 0) & 0x7fffffff;
-
-		// ReSharper disable once BuiltInTypeReferenceStyleForMemberAccess - required for .NET Framework
-		return String.Create(
+		return string.Create(
 			CodeDigits, fullCode, static (buffer, state) => {
 				for (byte i = 0; i < CodeDigits; i++) {
 					buffer[i] = CodeCharacters[(byte) (state % CodeCharacters.Count)];
@@ -151,7 +167,7 @@ public sealed class MobileAuthenticator : IDisposable {
 		(_, string? deviceID) = await CachedDeviceID.GetValue(ECacheFallback.SuccessPreviously).ConfigureAwait(false);
 
 		if (string.IsNullOrEmpty(deviceID)) {
-			Bot.ArchiLogger.LogGenericError(string.Format(CultureInfo.CurrentCulture, Strings.WarningFailedWithError, nameof(deviceID)));
+			Bot.ArchiLogger.LogGenericError(Strings.FormatWarningFailedWithError(nameof(deviceID)));
 
 			return null;
 		}
@@ -172,15 +188,14 @@ public sealed class MobileAuthenticator : IDisposable {
 			return null;
 		}
 
-		// ReSharper disable RedundantSuppressNullableWarningExpression - required for .NET Framework
-		ConfirmationsResponse? response = await Bot.ArchiWebHandler.GetConfirmations(deviceID!, confirmationHash!, time).ConfigureAwait(false);
+		ConfirmationsResponse? response = await Bot.ArchiWebHandler.GetConfirmations(deviceID, confirmationHash, time).ConfigureAwait(false);
 
 		if (response?.Success != true) {
 			return null;
 		}
 
 		foreach (Confirmation? confirmation in response.Confirmations.Where(static confirmation => (confirmation.ConfirmationType == Confirmation.EConfirmationType.Unknown) || !Enum.IsDefined(confirmation.ConfirmationType))) {
-			Bot.ArchiLogger.LogGenericError(string.Format(CultureInfo.CurrentCulture, Strings.WarningUnknownValuePleaseReport, nameof(confirmation.ConfirmationType), confirmation.ConfirmationType));
+			Bot.ArchiLogger.LogGenericError(Strings.FormatWarningUnknownValuePleaseReport(nameof(confirmation.ConfirmationType), $"{confirmation.ConfirmationType} ({confirmation.ConfirmationTypeName ?? "null"})"));
 		}
 
 		return response.Confirmations;
@@ -206,7 +221,7 @@ public sealed class MobileAuthenticator : IDisposable {
 				return Utilities.MathAdd(Utilities.GetUnixTime(), steamTimeDifference.Value);
 			}
 
-			ulong serverTime = await Bot.ArchiWebHandler.GetServerTime().ConfigureAwait(false);
+			ulong serverTime = await Bot.ArchiHandler.GetServerTime().ConfigureAwait(false);
 
 			if (serverTime == 0) {
 				return Utilities.GetUnixTime();
@@ -236,7 +251,7 @@ public sealed class MobileAuthenticator : IDisposable {
 		(_, string? deviceID) = await CachedDeviceID.GetValue(ECacheFallback.SuccessPreviously).ConfigureAwait(false);
 
 		if (string.IsNullOrEmpty(deviceID)) {
-			Bot.ArchiLogger.LogGenericError(string.Format(CultureInfo.CurrentCulture, Strings.WarningFailedWithError, nameof(deviceID)));
+			Bot.ArchiLogger.LogGenericError(Strings.FormatWarningFailedWithError(nameof(deviceID)));
 
 			return false;
 		}
@@ -255,10 +270,7 @@ public sealed class MobileAuthenticator : IDisposable {
 			return false;
 		}
 
-		// ReSharper disable RedundantSuppressNullableWarningExpression - required for .NET Framework
-		bool? result = await Bot.ArchiWebHandler.HandleConfirmations(deviceID!, confirmationHash!, time, confirmations, accept).ConfigureAwait(false);
-
-		// ReSharper restore RedundantSuppressNullableWarningExpression - required for .NET Framework
+		bool? result = await Bot.ArchiWebHandler.HandleConfirmations(deviceID, confirmationHash, time, confirmations, accept).ConfigureAwait(false);
 
 		if (!result.HasValue) {
 			// Request timed out
@@ -274,10 +286,7 @@ public sealed class MobileAuthenticator : IDisposable {
 		// In this case, we'll accept all pending confirmations one-by-one, synchronously (as Steam can't handle them in parallel)
 		// We totally ignore actual result returned by those calls, abort only if request timed out
 		foreach (Confirmation confirmation in confirmations) {
-			// ReSharper disable RedundantSuppressNullableWarningExpression - required for .NET Framework
-			bool? confirmationResult = await Bot.ArchiWebHandler.HandleConfirmation(deviceID!, confirmationHash!, time, confirmation.ID, confirmation.Nonce, accept).ConfigureAwait(false);
-
-			// ReSharper restore RedundantSuppressNullableWarningExpression - required for .NET Framework
+			bool? confirmationResult = await Bot.ArchiWebHandler.HandleConfirmation(deviceID, confirmationHash, time, confirmation.ID, confirmation.Nonce, accept).ConfigureAwait(false);
 
 			if (!confirmationResult.HasValue) {
 				return false;
@@ -287,7 +296,13 @@ public sealed class MobileAuthenticator : IDisposable {
 		return true;
 	}
 
-	internal void Init(Bot bot) => Bot = bot ?? throw new ArgumentNullException(nameof(bot));
+	internal void Init(Bot bot) {
+		ArgumentNullException.ThrowIfNull(bot);
+
+		Bot = bot;
+	}
+
+	internal void OnInitModules() => Utilities.InBackground(() => CachedDeviceID.Reset());
 
 	internal static async Task ResetSteamTimeDifference() {
 		if ((SteamTimeDifference == null) && (LastSteamTimeCheck == DateTime.MinValue)) {
@@ -312,9 +327,7 @@ public sealed class MobileAuthenticator : IDisposable {
 	}
 
 	private string? GenerateConfirmationHash(ulong time, string? tag = null) {
-		if (time == 0) {
-			throw new ArgumentOutOfRangeException(nameof(time));
-		}
+		ArgumentOutOfRangeException.ThrowIfZero(time);
 
 		if (Bot == null) {
 			throw new InvalidOperationException(nameof(Bot));
@@ -330,7 +343,7 @@ public sealed class MobileAuthenticator : IDisposable {
 			identitySecret = Convert.FromBase64String(IdentitySecret);
 		} catch (FormatException e) {
 			Bot.ArchiLogger.LogGenericException(e);
-			Bot.ArchiLogger.LogGenericError(string.Format(CultureInfo.CurrentCulture, Strings.ErrorIsInvalid, nameof(IdentitySecret)));
+			Bot.ArchiLogger.LogGenericError(Strings.FormatErrorIsInvalid(nameof(IdentitySecret)));
 
 			return null;
 		}
@@ -338,8 +351,7 @@ public sealed class MobileAuthenticator : IDisposable {
 		byte bufferSize = 8;
 
 		if (!string.IsNullOrEmpty(tag)) {
-			// ReSharper disable once RedundantSuppressNullableWarningExpression - required for .NET Framework
-			bufferSize += (byte) Math.Min(32, tag!.Length);
+			bufferSize += (byte) Math.Min(32, tag.Length);
 		}
 
 		byte[] timeArray = BitConverter.GetBytes(time);
@@ -348,18 +360,23 @@ public sealed class MobileAuthenticator : IDisposable {
 			Array.Reverse(timeArray);
 		}
 
-		byte[] buffer = new byte[bufferSize];
+		byte[] hash;
 
-		Array.Copy(timeArray, buffer, 8);
+		byte[] buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
 
-		if (!string.IsNullOrEmpty(tag)) {
-			// ReSharper disable once RedundantSuppressNullableWarningExpression - required for .NET Framework
-			Array.Copy(Encoding.UTF8.GetBytes(tag!), 0, buffer, 8, bufferSize - 8);
-		}
+		try {
+			Array.Copy(timeArray, buffer, timeArray.Length);
+
+			if (!string.IsNullOrEmpty(tag)) {
+				Array.Copy(Encoding.UTF8.GetBytes(tag), 0, buffer, timeArray.Length, bufferSize - timeArray.Length);
+			}
 
 #pragma warning disable CA5350 // This is actually a fair warning, but there is nothing we can do about Steam using weak cryptographic algorithms
-		byte[] hash = HMACSHA1.HashData(identitySecret, buffer);
+			hash = HMACSHA1.HashData(identitySecret, buffer.AsSpan()[..bufferSize]);
 #pragma warning restore CA5350 // This is actually a fair warning, but there is nothing we can do about Steam using weak cryptographic algorithms
+		} finally {
+			ArrayPool<byte>.Shared.Return(buffer);
+		}
 
 		return Convert.ToBase64String(hash);
 	}
@@ -385,7 +402,7 @@ public sealed class MobileAuthenticator : IDisposable {
 		);
 	}
 
-	private async Task<(bool Success, string? Result)> ResolveDeviceID() {
+	private async Task<(bool Success, string? Result)> ResolveDeviceID(CancellationToken cancellationToken = default) {
 		if (Bot == null) {
 			throw new InvalidOperationException(nameof(Bot));
 		}

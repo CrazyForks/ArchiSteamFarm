@@ -1,10 +1,12 @@
-﻿//     _                _      _  ____   _                           _____
+﻿// ----------------------------------------------------------------------------------------------
+//     _                _      _  ____   _                           _____
 //    / \    _ __  ___ | |__  (_)/ ___| | |_  ___   __ _  _ __ ___  |  ___|__ _  _ __  _ __ ___
 //   / _ \  | '__|/ __|| '_ \ | |\___ \ | __|/ _ \ / _` || '_ ` _ \ | |_  / _` || '__|| '_ ` _ \
 //  / ___ \ | |  | (__ | | | || | ___) || |_|  __/| (_| || | | | | ||  _|| (_| || |   | | | | | |
 // /_/   \_\|_|   \___||_| |_||_||____/  \__|\___| \__,_||_| |_| |_||_|   \__,_||_|   |_| |_| |_|
+// ----------------------------------------------------------------------------------------------
 // |
-// Copyright 2015-2023 Łukasz "JustArchi" Domeradzki
+// Copyright 2015-2025 Łukasz "JustArchi" Domeradzki
 // Contact: JustArchi@JustArchi.net
 // |
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,7 +23,6 @@
 
 using System;
 using System.ComponentModel;
-using System.Globalization;
 using System.Threading;
 using System.Threading.Tasks;
 using ArchiSteamFarm.Core;
@@ -59,7 +60,7 @@ internal sealed class BotCredentialsProvider : IAuthenticator {
 			return false;
 		}
 
-		// Ask the user what he wants
+		// Ask the user what they want
 		string input = await ProvideInput(ASF.EUserInputType.DeviceConfirmation, false).ConfigureAwait(false);
 
 		return input.Equals("Y", StringComparison.OrdinalIgnoreCase);
@@ -77,21 +78,21 @@ internal sealed class BotCredentialsProvider : IAuthenticator {
 		if (previousCodeWasIncorrect && (++LoginFailures >= MaxLoginFailures)) {
 			EResult reason = inputType == ASF.EUserInputType.TwoFactorAuthentication ? EResult.TwoFactorCodeMismatch : EResult.InvalidLoginAuthCode;
 
-			Bot.ArchiLogger.LogGenericWarning(string.Format(CultureInfo.CurrentCulture, Strings.BotUnableToLogin, reason, reason));
+			Bot.ArchiLogger.LogGenericWarning(Strings.FormatBotUnableToLogin(reason, reason));
 
-			if (++LoginFailures >= MaxLoginFailures) {
-				CancellationTokenSource.Cancel();
+			await CancellationTokenSource.CancelAsync().ConfigureAwait(false);
 
-				return "";
-			}
+			return "";
 		}
 
 		string? result = await Bot.RequestInput(inputType, previousCodeWasIncorrect).ConfigureAwait(false);
 
 		if (string.IsNullOrEmpty(result)) {
-			CancellationTokenSource.Cancel();
+			await CancellationTokenSource.CancelAsync().ConfigureAwait(false);
+
+			return "";
 		}
 
-		return result ?? "";
+		return result;
 	}
 }
