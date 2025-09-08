@@ -248,6 +248,11 @@ internal static class ArchiKestrel {
 		// Add support for websockets that we use e.g. in /Api/NLog
 		app.UseWebSockets();
 
+		// Add support for output caching
+		if (ASF.GlobalConfig?.OptimizationMode != GlobalConfig.EOptimizationMode.MinMemoryUsage) {
+			app.UseOutputCache();
+		}
+
 		// Add additional endpoints provided by plugins
 		foreach (IWebServiceProvider plugin in PluginsCore.ActivePlugins.OfType<IWebServiceProvider>()) {
 			try {
@@ -261,7 +266,11 @@ internal static class ArchiKestrel {
 		app.MapControllers();
 
 		// Add support for OpenAPI, responsible for automatic API documentation generation, this should be on the end, once we're done with API
-		app.MapOpenApi("/swagger/{documentName}/swagger.json");
+		IEndpointConventionBuilder openApi = app.MapOpenApi("/swagger/{documentName}/swagger.json");
+
+		if (ASF.GlobalConfig?.OptimizationMode != GlobalConfig.EOptimizationMode.MinMemoryUsage) {
+			openApi.CacheOutput();
+		}
 
 		// Add support for swagger UI, this should be after swagger, obviously
 		app.MapScalarApiReference(
@@ -332,6 +341,11 @@ internal static class ArchiKestrel {
 		if (!string.IsNullOrEmpty(ipcPassword)) {
 			// We apply CORS policy only with IPCPassword set as an extra authentication measure
 			services.AddCors(static options => options.AddDefaultPolicy(static policyBuilder => policyBuilder.AllowAnyOrigin()));
+		}
+
+		// Add support for output caching
+		if (ASF.GlobalConfig?.OptimizationMode != GlobalConfig.EOptimizationMode.MinMemoryUsage) {
+			services.AddOutputCache();
 		}
 
 		// Add support for OpenAPI, responsible for automatic API documentation generation
